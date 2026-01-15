@@ -15,4 +15,4 @@ new_classes = ["MatchmakerDO", "RoomDO"]
 [[d1_databases]]
 binding = "DB"
 database_name = "durak_db"
-database_id = "PASTE_YOUR_D1_UUID_HERE"
+database_id = "ee15230e-4103-4bc8-854b-3bb234949989"
