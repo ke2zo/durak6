@@ -237,6 +237,7 @@ export default {
     <button id="btnAuth">1) Auth</button>
     <button id="btnMatch" disabled>2) Matchmaking</button>
     <button id="btnWS" disabled>3) Connect WS</button>
+    <button id="btnMove" disabled>4) Send MOVE</button>
   </div>
 
   <div class="row">
@@ -254,6 +255,7 @@ export default {
     const btnAuth = document.getElementById("btnAuth");
     const btnMatch = document.getElementById("btnMatch");
     const btnWS = document.getElementById("btnWS");
+    const btnMove = document.getElementById("btnMove");
     const roomInput = document.getElementById("room");
 
     let sessionToken = "";
@@ -339,6 +341,7 @@ export default {
         ws.onopen = () => {
           log("WS open. Sending JOIN...");
           ws.send(JSON.stringify({ type: "JOIN", sessionToken, roomId }));
+          btnMove.disabled = false;
         };
 
         ws.onmessage = (ev) => {
@@ -353,6 +356,14 @@ export default {
         log("WS error: " + (e?.message || String(e)));
       }
     };
+
+  btnMove.onclick = () => {
+  if (!ws || ws.readyState !== 1) { log("WS not connected"); return; }
+  const payload = { type: "MOVE", action: "PING", ts: Date.now() };
+  log("WS ->", payload);
+  ws.send(JSON.stringify(payload));
+};
+
   </script>
 </body>
 </html>`
