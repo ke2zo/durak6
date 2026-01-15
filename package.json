@@ -1,0 +1,11 @@
+{
+  "name": "durak-backend",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  },
+  "scripts": {
+    "deploy": "wrangler deploy"
+  }
+}
