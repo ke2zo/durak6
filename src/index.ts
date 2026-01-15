@@ -1,5 +1,5 @@
 /// <reference types="@cloudflare/workers-types" />
-declare const window: any;
+
 
 export interface Env {
   BOT_TOKEN: string
@@ -12,7 +12,26 @@ export interface Env {
 
 type Json = any
 
-const initData = window.Telegram?.WebApp?.initData || "";
+const g: any = globalThis as any;
+
+async function auth() {
+  const initData = g.Telegram?.WebApp?.initData || "";
+  if (!initData) {
+    console.log("NO INITDATA: открой мини-приложение внутри Telegram через кнопку WebApp");
+    return;
+  }
+
+  const r = await fetch("https://durak9.kirill-lee66.workers.dev/api/auth/telegram", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ initData }),
+  });
+
+  const data = await r.json();
+  console.log("AUTH RESULT:", data);
+}
+
+auth();
 
 
 function json(data: Json, status = 200, headers: Record<string, string> = {}) {
