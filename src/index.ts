@@ -263,9 +263,13 @@ export default {
     let ws = null;
 
     function log(...args){
-      out.textContent += "\\n" + args.map(a => (typeof a==="string"?a:JSON.stringify(a,null,2))).join(" ");
-      out.scrollTop = out.scrollHeight;
-    }
+      const line = args.map(a => {
+        if (typeof a === "string") return a;
+        try { return JSON.stringify(a, null, 2); } catch { return String(a); }
+    }).join(" ");
+    out.textContent += "\\n" + line;
+    out.scrollTop = out.scrollHeight;
+   }
 
     function setOut(text){ out.textContent = text; }
 
@@ -345,10 +349,13 @@ export default {
         };
 
         ws.onmessage = (ev) => {
-          let msg = ev.data;
-          try { msg = JSON.parse(ev.data); } catch {}
-          log("WS <-", msg);
-        };
+        try {
+          const obj = JSON.parse(String(ev.data));
+          log("WS <-", obj);
+        } catch {
+          log("WS <- (raw)", String(ev.data));
+        }
+      };
 
         ws.onclose = (ev) => log("WS close:", { code: ev.code, reason: ev.reason });
         ws.onerror = () => log("WS error");
