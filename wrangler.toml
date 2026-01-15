@@ -1,4 +1,4 @@
-name = "durak-backend"
+name = "durak9"
 main = "src/index.ts"
 compatibility_date = "2026-01-15"
 
@@ -10,7 +10,7 @@ bindings = [
 
 [[migrations]]
 tag = "v1"
-new_classes = ["MatchmakerDO", "RoomDO"]
+new_sqlite_classes = ["MatchmakerDO", "RoomDO"]
 
 [[d1_databases]]
 binding = "DB"
