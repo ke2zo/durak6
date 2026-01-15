@@ -1,4 +1,5 @@
 /// <reference types="@cloudflare/workers-types" />
+declare const window: any;
 
 export interface Env {
   BOT_TOKEN: string
@@ -11,12 +12,7 @@ export interface Env {
 
 type Json = any
 
-const g: any = globalThis as any;
-const initData = g.Telegram?.WebApp?.initData || "";
-
-g.document.body.style.whiteSpace = "pre-wrap";
-g.document.body.innerText = initData || "NO INITDATA";
-
+const initData = window.Telegram?.WebApp?.initData || "";
 
 
 function json(data: Json, status = 200, headers: Record<string, string> = {}) {
