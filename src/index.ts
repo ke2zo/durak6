@@ -35,7 +35,7 @@ function bad(status: number, message: string, extra?: Json) {
 // --------------------- Crypto helpers ---------------------
 
 async function hmacSha256Raw(keyBytes: Uint8Array, data: string): Promise<ArrayBuffer> {
-  // Make a strict ArrayBuffer slice to avoid TS BufferSource overload issues
+  // Strict ArrayBuffer slice to avoid TS BufferSource overload issues
   const keyBuf = keyBytes.buffer.slice(
     keyBytes.byteOffset,
     keyBytes.byteOffset + keyBytes.byteLength
@@ -66,9 +66,7 @@ function toHex(buf: ArrayBuffer): string {
 
 function hexToBytes(hex: string): Uint8Array {
   const out = new Uint8Array(hex.length / 2)
-  for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
-  }
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
   return out
 }
 
@@ -108,6 +106,7 @@ async function validateTelegramInitData(
   botToken: string
 ): Promise<{ ok: boolean; user?: any; error?: string }> {
   if (!initData) return { ok: false, error: "initData is empty" }
+  if (!botToken) return { ok: false, error: "BOT_TOKEN is not set" }
 
   const data = parseInitData(initData)
   const hash = data["hash"]
@@ -119,7 +118,6 @@ async function validateTelegramInitData(
 
   const dataCheckString = keys.map((k) => `${k}=${data[k]}`).join("\n")
 
-  // secret_key bytes = HMAC_SHA256("WebAppData", bot_token)
   const secretKeyHex = toHex(await hmacSha256Text("WebAppData", botToken))
   const secretKeyBytes = hexToBytes(secretKeyHex)
 
@@ -150,6 +148,7 @@ async function signSession(payload: object, appSecret: string): Promise<string> 
 }
 
 async function verifySession(token: string, appSecret: string): Promise<any | null> {
+  if (!token || !appSecret) return null
   const parts = token.split(".")
   if (parts.length !== 2) return null
   const [bodyB64, sigHex] = parts
@@ -166,7 +165,6 @@ async function verifySession(token: string, appSecret: string): Promise<any | nu
 // --------------------- D1 schema & helpers ---------------------
 
 async function ensureSchema(env: Env) {
-  // Use prepare().run() (no DB.exec) to avoid runtime surprises
   await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,9 +212,9 @@ export default {
 
     if (request.method === "OPTIONS") return new Response(null, { status: 204 })
 
-    // Mini front (no separate frontend needed)
+    // Mini front (dev UI: Auth -> Match -> WS)
     if (url.pathname === "/mini") {
-  const html = `<!doctype html>
+      const html = `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -358,17 +356,29 @@ export default {
   </script>
 </body>
 </html>`
-
-  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } })
-}
-
+      return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } })
+    }
 
     // Health
     if (url.pathname === "/") return new Response("OK", { status: 200 })
 
-    // Telegram webhook endpoint (optional)
+    // Optional webhook endpoint placeholder
     if (env.WEBHOOK_SECRET && url.pathname === `/${env.WEBHOOK_SECRET}`) {
       return new Response("OK", { status: 200 })
+    }
+
+    // Debug check for env presence (safe)
+    if (url.pathname === "/env-check") {
+      return json({
+        ok: true,
+        hasBOT_TOKEN: !!env.BOT_TOKEN,
+        botTokenLen: env.BOT_TOKEN?.length ?? 0,
+        hasAPP_SECRET: !!env.APP_SECRET,
+        appSecretLen: env.APP_SECRET?.length ?? 0,
+        hasDB: !!env.DB,
+        hasMM: !!env.MM,
+        hasROOM: !!env.ROOM,
+      })
     }
 
     // DO test
@@ -418,8 +428,12 @@ export default {
 
       // POST /api/auth/telegram { initData }
       if (url.pathname === "/api/auth/telegram" && request.method === "POST") {
+        if (!env.APP_SECRET) return bad(500, "APP_SECRET is not set")
+        if (!env.BOT_TOKEN) return bad(500, "BOT_TOKEN is not set")
+
         const body = (await request.json().catch(() => ({}))) as { initData?: string }
         const initData = String(body.initData || "")
+
         const v = await validateTelegramInitData(initData, env.BOT_TOKEN)
         if (!v.ok) return bad(401, v.error || "auth failed")
 
@@ -435,7 +449,11 @@ export default {
 
         return ok({
           sessionToken,
-          user: { id: v.user.id, first_name: v.user.first_name, username: v.user.username },
+          user: {
+            id: v.user.id,
+            first_name: v.user.first_name,
+            username: v.user.username,
+          },
         })
       }
 
@@ -509,6 +527,7 @@ export class MatchmakerDO {
 
     const roomId = crypto.randomUUID()
 
+    // init room (persisted in RoomDO storage)
     const roomStub = this.env.ROOM.get(this.env.ROOM.idFromName(roomId))
     await roomStub.fetch("https://room/init", {
       method: "POST",
@@ -520,7 +539,13 @@ export class MatchmakerDO {
   }
 }
 
-// --------------------- Durable Object: RoomDO (WebSocket room) ---------------------
+// --------------------- Durable Object: RoomDO (WebSocket room, persisted meta) ---------------------
+
+type RoomMeta = {
+  roomId: string | null
+  players: string[]
+  turnIndex: number
+}
 
 type ServerMsg =
   | { type: "STATE"; roomId: string | null; players: string[]; you: string; turn: string | null }
@@ -530,14 +555,39 @@ type ServerMsg =
   | { type: string; [k: string]: any }
 
 export class RoomDO {
+  private state: DurableObjectState
   private env: Env
+
+  private loaded = false
   private roomId: string | null = null
   private players: string[] = []
   private turnIndex = 0
+
   private socketsByTgId = new Map<string, WebSocket>()
 
   constructor(state: DurableObjectState, env: Env) {
+    this.state = state
     this.env = env
+  }
+
+  private async load() {
+    if (this.loaded) return
+    const meta = await this.state.storage.get<RoomMeta>("meta")
+    if (meta) {
+      this.roomId = meta.roomId ?? null
+      this.players = Array.isArray(meta.players) ? meta.players.map(String) : []
+      this.turnIndex = typeof meta.turnIndex === "number" ? meta.turnIndex : 0
+    }
+    this.loaded = true
+  }
+
+  private async save() {
+    const meta: RoomMeta = {
+      roomId: this.roomId,
+      players: this.players,
+      turnIndex: this.turnIndex,
+    }
+    await this.state.storage.put("meta", meta)
   }
 
   private broadcast(obj: ServerMsg) {
@@ -550,18 +600,26 @@ export class RoomDO {
   }
 
   async fetch(request: Request) {
+    await this.load()
     const url = new URL(request.url)
 
+    // init room (called by Matchmaker)
     if (url.pathname === "/init" && request.method === "POST") {
       const body = (await request.json().catch(() => ({}))) as { roomId?: string; players?: unknown[] }
-      this.roomId = body.roomId ?? null
-      this.players = Array.isArray(body.players) ? body.players.map(String) : []
+      const incomingRoomId = body.roomId ? String(body.roomId) : null
+      const incomingPlayers = Array.isArray(body.players) ? body.players.map(String) : []
+
+      this.roomId = incomingRoomId
+      this.players = incomingPlayers
       this.turnIndex = 0
+      await this.save()
+
       return ok({ roomId: this.roomId, players: this.players })
     }
 
     if (url.pathname === "/ping") return new Response("RoomDO alive", { status: 200 })
 
+    // websocket upgrade
     if (request.headers.get("Upgrade") !== "websocket") {
       return bad(426, "Expected websocket")
     }
@@ -582,7 +640,7 @@ export class RoomDO {
         return
       }
 
-      // JOIN: { type:"JOIN", sessionToken:"..." }
+      // JOIN: { type:"JOIN", sessionToken:"...", roomId:"..." }
       if (msg?.type === "JOIN") {
         const sessionToken = String(msg.sessionToken || "")
         const session = (await verifySession(sessionToken, this.env.APP_SECRET)) as
@@ -598,6 +656,7 @@ export class RoomDO {
           } catch {}
           return
         }
+
         if (session.exp < Date.now()) {
           try {
             server.send(JSON.stringify({ type: "ERROR", code: "SESSION_EXPIRED" } as ServerMsg))
@@ -608,8 +667,12 @@ export class RoomDO {
           return
         }
 
+        // Ensure meta loaded (in case DO was restarted)
+        await this.load()
+
         const tgId = String(session.tg_id)
 
+        // If room is initialized, allow only listed players
         if (this.players.length > 0 && !this.players.includes(tgId)) {
           try {
             server.send(JSON.stringify({ type: "ERROR", code: "NOT_IN_ROOM" } as ServerMsg))
@@ -620,6 +683,7 @@ export class RoomDO {
           return
         }
 
+        // reconnect replace
         const prev = this.socketsByTgId.get(tgId)
         if (prev) {
           try {
@@ -628,19 +692,20 @@ export class RoomDO {
         }
         this.socketsByTgId.set(tgId, server)
 
+        const turn = this.players[this.turnIndex] ?? null
         const stateMsg: ServerMsg = {
           type: "STATE",
           roomId: this.roomId,
           players: this.players,
           you: tgId,
-          turn: this.players[this.turnIndex] ?? null,
+          turn,
         }
         try {
           server.send(JSON.stringify(stateMsg))
         } catch {}
 
         if (this.socketsByTgId.size === 2) {
-          this.broadcast({ type: "READY", turn: this.players[this.turnIndex] ?? null })
+          this.broadcast({ type: "READY", turn })
         }
         return
       }
@@ -665,7 +730,11 @@ export class RoomDO {
           return
         }
 
-        if (this.players.length === 2) this.turnIndex = 1 - this.turnIndex
+        // MVP: any MOVE toggles turn
+        if (this.players.length === 2) {
+          this.turnIndex = 1 - this.turnIndex
+          await this.save()
+        }
 
         this.broadcast({
           type: "TURN",
