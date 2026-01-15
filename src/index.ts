@@ -11,6 +11,14 @@ export interface Env {
 
 type Json = any
 
+const g: any = globalThis as any;
+const initData = g.Telegram?.WebApp?.initData || "";
+
+g.document.body.style.whiteSpace = "pre-wrap";
+g.document.body.innerText = initData || "NO INITDATA";
+
+
+
 function json(data: Json, status = 200, headers: Record<string, string> = {}) {
   return new Response(JSON.stringify(data), {
     status,
