@@ -1,6 +1,5 @@
 /// <reference types="@cloudflare/workers-types" />
 
-
 export interface Env {
   BOT_TOKEN: string
   APP_SECRET: string
@@ -11,28 +10,6 @@ export interface Env {
 }
 
 type Json = any
-
-const g: any = globalThis as any;
-
-async function auth() {
-  const initData = g.Telegram?.WebApp?.initData || "";
-  if (!initData) {
-    console.log("NO INITDATA: открой мини-приложение внутри Telegram через кнопку WebApp");
-    return;
-  }
-
-  const r = await fetch("https://durak9.kirill-lee66.workers.dev/api/auth/telegram", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ initData }),
-  });
-
-  const data = await r.json();
-  console.log("AUTH RESULT:", data);
-}
-
-auth();
-
 
 function json(data: Json, status = 200, headers: Record<string, string> = {}) {
   return new Response(JSON.stringify(data), {
@@ -58,22 +35,22 @@ function bad(status: number, message: string, extra?: Json) {
 // --------------------- Crypto helpers ---------------------
 
 async function hmacSha256Raw(keyBytes: Uint8Array, data: string): Promise<ArrayBuffer> {
-  // ВАЖНО: передаём ArrayBuffer, чтобы TS не ругался на SharedArrayBuffer/ArrayBufferLike
+  // Make a strict ArrayBuffer slice to avoid TS BufferSource overload issues
   const keyBuf = keyBytes.buffer.slice(
     keyBytes.byteOffset,
     keyBytes.byteOffset + keyBytes.byteLength
-  )
+  ) as ArrayBuffer
 
   const cryptoKey = await crypto.subtle.importKey(
     "raw",
-    keyBuf as ArrayBuffer,
+    keyBuf,
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"]
   )
 
-  const dataBuf = new TextEncoder().encode(data)
-  return crypto.subtle.sign("HMAC", cryptoKey, dataBuf)
+  const dataBytes = new TextEncoder().encode(data)
+  return crypto.subtle.sign("HMAC", cryptoKey, dataBytes)
 }
 
 async function hmacSha256Text(keyText: string, data: string): Promise<ArrayBuffer> {
@@ -126,11 +103,10 @@ function parseInitData(initData: string): Record<string, string> {
  * 2) secret_key bytes = HMAC_SHA256("WebAppData", bot_token)
  * 3) expected_hash = HEX(HMAC_SHA256(secret_key, data_check_string))
  */
-async function validateTelegramInitData(initData: string, botToken: string): Promise<{
-  ok: boolean
-  user?: any
-  error?: string
-}> {
+async function validateTelegramInitData(
+  initData: string,
+  botToken: string
+): Promise<{ ok: boolean; user?: any; error?: string }> {
   if (!initData) return { ok: false, error: "initData is empty" }
 
   const data = parseInitData(initData)
@@ -143,13 +119,14 @@ async function validateTelegramInitData(initData: string, botToken: string): Pro
 
   const dataCheckString = keys.map((k) => `${k}=${data[k]}`).join("\n")
 
+  // secret_key bytes = HMAC_SHA256("WebAppData", bot_token)
   const secretKeyHex = toHex(await hmacSha256Text("WebAppData", botToken))
   const secretKeyBytes = hexToBytes(secretKeyHex)
 
   const expectedHex = toHex(await hmacSha256Raw(secretKeyBytes, dataCheckString))
   if (expectedHex !== hash) return { ok: false, error: "invalid hash" }
 
-  let user: any = undefined
+  let user: any
   if (data["user"]) {
     try {
       user = JSON.parse(data["user"])
@@ -189,7 +166,7 @@ async function verifySession(token: string, appSecret: string): Promise<any | nu
 // --------------------- D1 schema & helpers ---------------------
 
 async function ensureSchema(env: Env) {
-  // Никаких env.DB.exec — только prepare().run(), чтобы не словить 1101 из-за несовместимости
+  // Use prepare().run() (no DB.exec) to avoid runtime surprises
   await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -237,6 +214,45 @@ export default {
 
     if (request.method === "OPTIONS") return new Response(null, { status: 204 })
 
+    // Mini front (no separate frontend needed)
+    if (url.pathname === "/mini") {
+      const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Durak WebApp Test</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    body{font-family:system-ui,sans-serif;padding:16px;white-space:pre-wrap}
+    button{padding:10px 14px;font-size:16px;border-radius:12px}
+    pre{background:#f6f6f6;padding:12px;border-radius:12px;overflow:auto}
+  </style>
+</head>
+<body>
+  <button id="btn">Auth</button>
+  <pre id="out">Нажми Auth — получишь sessionToken.</pre>
+  <script>
+    const out = document.getElementById("out");
+    document.getElementById("btn").onclick = async () => {
+      const initData = window.Telegram?.WebApp?.initData || "";
+      if (!initData) { out.textContent = "NO INITDATA. Открой как WebApp внутри Telegram."; return; }
+
+      out.textContent = "Sending initData to /api/auth/telegram ...";
+      const r = await fetch("/api/auth/telegram", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ initData })
+      });
+      const data = await r.json().catch(() => ({ ok:false, error:"bad json" }));
+      out.textContent = JSON.stringify(data, null, 2);
+    };
+  </script>
+</body>
+</html>`
+      return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } })
+    }
+
     // Health
     if (url.pathname === "/") return new Response("OK", { status: 200 })
 
@@ -256,7 +272,7 @@ export default {
       }
     }
 
-    // D1 test (fixed)
+    // D1 test
     if (url.pathname === "/d1-test") {
       try {
         await ensureSchema(env)
@@ -309,11 +325,7 @@ export default {
 
         return ok({
           sessionToken,
-          user: {
-            id: v.user.id,
-            first_name: v.user.first_name,
-            username: v.user.username,
-          },
+          user: { id: v.user.id, first_name: v.user.first_name, username: v.user.username },
         })
       }
 
@@ -321,7 +333,11 @@ export default {
       if (url.pathname === "/api/matchmaking" && request.method === "POST") {
         const auth = request.headers.get("authorization") || ""
         const token = auth.startsWith("Bearer ") ? auth.slice(7) : ""
-        const session = (await verifySession(token, env.APP_SECRET)) as { tg_id: string; exp: number } | null
+
+        const session = (await verifySession(token, env.APP_SECRET)) as
+          | { tg_id: string; exp: number }
+          | null
+
         if (!session) return bad(401, "invalid session")
         if (session.exp < Date.now()) return bad(401, "session expired")
 
@@ -368,25 +384,21 @@ export class MatchmakerDO {
     const tgId = body.tg_id ? String(body.tg_id) : ""
     if (!tgId) return bad(400, "tg_id missing")
 
-    // first player queued
     if (!this.waiting) {
       this.waiting = tgId
       return json({ ok: true, status: "queued" }, 200)
     }
 
-    // same user keeps queued
     if (this.waiting === tgId) {
       return json({ ok: true, status: "queued" }, 200)
     }
 
-    // match found
     const p1 = this.waiting
     const p2 = tgId
     this.waiting = null
 
     const roomId = crypto.randomUUID()
 
-    // init room
     const roomStub = this.env.ROOM.get(this.env.ROOM.idFromName(roomId))
     await roomStub.fetch("https://room/init", {
       method: "POST",
@@ -430,7 +442,6 @@ export class RoomDO {
   async fetch(request: Request) {
     const url = new URL(request.url)
 
-    // init room (called by Matchmaker)
     if (url.pathname === "/init" && request.method === "POST") {
       const body = (await request.json().catch(() => ({}))) as { roomId?: string; players?: unknown[] }
       this.roomId = body.roomId ?? null
@@ -441,7 +452,6 @@ export class RoomDO {
 
     if (url.pathname === "/ping") return new Response("RoomDO alive", { status: 200 })
 
-    // websocket upgrade
     if (request.headers.get("Upgrade") !== "websocket") {
       return bad(426, "Expected websocket")
     }
@@ -457,18 +467,21 @@ export class RoomDO {
         msg = JSON.parse(String(ev.data))
       } catch {
         try {
-          server.send(JSON.stringify({ type: "ERROR", code: "BAD_JSON" } satisfies ServerMsg))
+          server.send(JSON.stringify({ type: "ERROR", code: "BAD_JSON" } as ServerMsg))
         } catch {}
         return
       }
 
-      // JOIN: { type:"JOIN", sessionToken:"...", roomId:"..." }
+      // JOIN: { type:"JOIN", sessionToken:"..." }
       if (msg?.type === "JOIN") {
         const sessionToken = String(msg.sessionToken || "")
-        const session = await verifySession(sessionToken, this.env.APP_SECRET)
+        const session = (await verifySession(sessionToken, this.env.APP_SECRET)) as
+          | { tg_id: string; exp: number }
+          | null
+
         if (!session) {
           try {
-            server.send(JSON.stringify({ type: "ERROR", code: "BAD_SESSION" } satisfies ServerMsg))
+            server.send(JSON.stringify({ type: "ERROR", code: "BAD_SESSION" } as ServerMsg))
           } catch {}
           try {
             server.close(1008, "Bad session")
@@ -477,7 +490,7 @@ export class RoomDO {
         }
         if (session.exp < Date.now()) {
           try {
-            server.send(JSON.stringify({ type: "ERROR", code: "SESSION_EXPIRED" } satisfies ServerMsg))
+            server.send(JSON.stringify({ type: "ERROR", code: "SESSION_EXPIRED" } as ServerMsg))
           } catch {}
           try {
             server.close(1008, "Session expired")
@@ -489,7 +502,7 @@ export class RoomDO {
 
         if (this.players.length > 0 && !this.players.includes(tgId)) {
           try {
-            server.send(JSON.stringify({ type: "ERROR", code: "NOT_IN_ROOM" } satisfies ServerMsg))
+            server.send(JSON.stringify({ type: "ERROR", code: "NOT_IN_ROOM" } as ServerMsg))
           } catch {}
           try {
             server.close(1008, "Not in room")
@@ -497,7 +510,6 @@ export class RoomDO {
           return
         }
 
-        // reconnect replace
         const prev = this.socketsByTgId.get(tgId)
         if (prev) {
           try {
@@ -506,7 +518,6 @@ export class RoomDO {
         }
         this.socketsByTgId.set(tgId, server)
 
-        // send state
         const stateMsg: ServerMsg = {
           type: "STATE",
           roomId: this.roomId,
@@ -518,7 +529,6 @@ export class RoomDO {
           server.send(JSON.stringify(stateMsg))
         } catch {}
 
-        // if both connected
         if (this.socketsByTgId.size === 2) {
           this.broadcast({ type: "READY", turn: this.players[this.turnIndex] ?? null })
         }
@@ -532,7 +542,7 @@ export class RoomDO {
 
         if (!sender) {
           try {
-            server.send(JSON.stringify({ type: "ERROR", code: "NOT_JOINED" } satisfies ServerMsg))
+            server.send(JSON.stringify({ type: "ERROR", code: "NOT_JOINED" } as ServerMsg))
           } catch {}
           return
         }
@@ -540,12 +550,11 @@ export class RoomDO {
         const currentTurn = this.players[this.turnIndex]
         if (this.players.length === 2 && sender !== currentTurn) {
           try {
-            server.send(JSON.stringify({ type: "ERROR", code: "NOT_YOUR_TURN" } satisfies ServerMsg))
+            server.send(JSON.stringify({ type: "ERROR", code: "NOT_YOUR_TURN" } as ServerMsg))
           } catch {}
           return
         }
 
-        // MVP: любой ход переключает ход
         if (this.players.length === 2) this.turnIndex = 1 - this.turnIndex
 
         this.broadcast({
@@ -557,7 +566,7 @@ export class RoomDO {
       }
 
       try {
-        server.send(JSON.stringify({ type: "ERROR", code: "UNKNOWN_MSG" } satisfies ServerMsg))
+        server.send(JSON.stringify({ type: "ERROR", code: "UNKNOWN_MSG" } as ServerMsg))
       } catch {}
     })
 
