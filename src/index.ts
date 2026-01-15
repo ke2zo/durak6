@@ -216,42 +216,152 @@ export default {
 
     // Mini front (no separate frontend needed)
     if (url.pathname === "/mini") {
-      const html = `<!doctype html>
+  const html = `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Durak WebApp Test</title>
+  <title>Durak WebApp Dev</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
-    body{font-family:system-ui,sans-serif;padding:16px;white-space:pre-wrap}
-    button{padding:10px 14px;font-size:16px;border-radius:12px}
-    pre{background:#f6f6f6;padding:12px;border-radius:12px;overflow:auto}
+    body{font-family:system-ui,sans-serif;padding:16px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+    button{padding:10px 14px;font-size:16px;border-radius:12px;border:1px solid #ddd;background:#fff;cursor:pointer}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    pre{background:#f6f6f6;padding:12px;border-radius:12px;overflow:auto;white-space:pre-wrap}
+    .small{font-size:12px;color:#666}
+    input{padding:10px 12px;border-radius:12px;border:1px solid #ddd;min-width:280px}
   </style>
 </head>
 <body>
-  <button id="btn">Auth</button>
-  <pre id="out">Нажми Auth — получишь sessionToken.</pre>
+  <h2>Durak WebApp Dev</h2>
+  <div class="row">
+    <button id="btnAuth">1) Auth</button>
+    <button id="btnMatch" disabled>2) Matchmaking</button>
+    <button id="btnWS" disabled>3) Connect WS</button>
+  </div>
+
+  <div class="row">
+    <input id="room" placeholder="roomId (auto after match)" />
+  </div>
+
+  <div class="small">
+    Tip: открой мини-апп в двух клиентах/аккаунтах и нажми Matchmaking в обоих, чтобы получить matched.
+  </div>
+
+  <pre id="out">Ready.</pre>
+
   <script>
     const out = document.getElementById("out");
-    document.getElementById("btn").onclick = async () => {
-      const initData = window.Telegram?.WebApp?.initData || "";
-      if (!initData) { out.textContent = "NO INITDATA. Открой как WebApp внутри Telegram."; return; }
+    const btnAuth = document.getElementById("btnAuth");
+    const btnMatch = document.getElementById("btnMatch");
+    const btnWS = document.getElementById("btnWS");
+    const roomInput = document.getElementById("room");
 
-      out.textContent = "Sending initData to /api/auth/telegram ...";
-      const r = await fetch("/api/auth/telegram", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ initData })
-      });
-      const data = await r.json().catch(() => ({ ok:false, error:"bad json" }));
-      out.textContent = JSON.stringify(data, null, 2);
+    let sessionToken = "";
+    let roomId = "";
+    let ws = null;
+
+    function log(...args){
+      out.textContent += "\\n" + args.map(a => (typeof a==="string"?a:JSON.stringify(a,null,2))).join(" ");
+      out.scrollTop = out.scrollHeight;
+    }
+
+    function setOut(text){ out.textContent = text; }
+
+    btnAuth.onclick = async () => {
+      try {
+        const initData = window.Telegram?.WebApp?.initData || "";
+        if (!initData) { setOut("NO INITDATA. Открой как WebApp внутри Telegram."); return; }
+
+        setOut("Auth: sending initData...");
+        const r = await fetch("/api/auth/telegram", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ initData })
+        });
+        const data = await r.json();
+        setOut(JSON.stringify(data, null, 2));
+
+        if (data.ok && data.sessionToken) {
+          sessionToken = data.sessionToken;
+          btnMatch.disabled = false;
+          log("Auth OK. sessionToken saved.");
+        } else {
+          log("Auth failed.");
+        }
+      } catch (e) {
+        setOut("Auth error: " + (e?.message || String(e)));
+      }
+    };
+
+    btnMatch.onclick = async () => {
+      try {
+        if (!sessionToken) { log("No sessionToken. Press Auth first."); return; }
+        log("Matchmaking: calling /api/matchmaking ...");
+
+        const r = await fetch("/api/matchmaking", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "authorization": "Bearer " + sessionToken
+          },
+          body: "{}"
+        });
+
+        const data = await r.json();
+        log(data);
+
+        if (data.ok && data.status === "matched") {
+          roomId = data.roomId;
+          roomInput.value = roomId;
+          btnWS.disabled = false;
+          log("Matched! roomId=" + roomId + " wsUrl=" + data.wsUrl);
+        } else if (data.ok && data.status === "queued") {
+          log("Queued. Open another client and press Matchmaking there too.");
+        }
+      } catch (e) {
+        log("Match error: " + (e?.message || String(e)));
+      }
+    };
+
+    btnWS.onclick = async () => {
+      try {
+        if (!sessionToken) { log("No sessionToken. Press Auth first."); return; }
+        roomId = roomInput.value.trim();
+        if (!roomId) { log("No roomId. Get matched first."); return; }
+
+        const wsUrl = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/" + roomId;
+        log("Connecting WS:", wsUrl);
+
+        if (ws) { try { ws.close(); } catch {} ws = null; }
+
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+          log("WS open. Sending JOIN...");
+          ws.send(JSON.stringify({ type: "JOIN", sessionToken, roomId }));
+        };
+
+        ws.onmessage = (ev) => {
+          let msg = ev.data;
+          try { msg = JSON.parse(ev.data); } catch {}
+          log("WS <-", msg);
+        };
+
+        ws.onclose = (ev) => log("WS close:", { code: ev.code, reason: ev.reason });
+        ws.onerror = () => log("WS error");
+      } catch (e) {
+        log("WS error: " + (e?.message || String(e)));
+      }
     };
   </script>
 </body>
 </html>`
-      return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } })
-    }
+
+  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } })
+}
+
 
     // Health
     if (url.pathname === "/") return new Response("OK", { status: 200 })
