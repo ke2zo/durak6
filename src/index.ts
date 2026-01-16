@@ -1108,12 +1108,19 @@ export class RoomDO {
     }
 
     // websocket
+    // websocket
     if (request.headers.get("Upgrade") !== "websocket") return bad(426, "Expected websocket")
 
     const pair = new WebSocketPair()
     const client = pair[0]
     const server = pair[1]
-    server.accept()
+
+// ✅ ВАЖНО: НЕ делаем server.accept()
+this.state.acceptWebSocket(server) // accept + регистрация для hibernation
+this.setAttach(server, {})         // можно после acceptWebSocket
+
+return new Response(null, { status: 101, webSocket: client })
+
 
     // IMPORTANT: make it hibernatable
     this.state.acceptWebSocket(server)
