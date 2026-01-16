@@ -1,16 +1,14 @@
-name = "durak-backend"
+name = "durak9"
 main = "src/index.ts"
 compatibility_date = "2026-01-15"
 
-[durable_objects]
-bindings = [
-  { name = "MM", class_name = "MatchmakerDO" },
-  { name = "ROOM", class_name = "RoomDO" }
-]
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "RoomDO"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["MatchmakerDO", "RoomDO"]
+new_sqlite_classes = ["RoomDO"]
 
 [[d1_databases]]
 binding = "DB"
