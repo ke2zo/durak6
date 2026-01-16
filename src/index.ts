@@ -1,31 +1,37 @@
 /// <reference types="@cloudflare/workers-types" />
 
 /**
- * Durak backend (Invite rooms) — 2–4 players, Podkidnoy/Perevodnoy, deck 24/36
- * Cloudflare Workers + Durable Objects + D1 (optional users table)
+ * Durable / reliable 2-4 player Durak (podkidnoy + perevodnoy) backend
+ * Cloudflare Workers + Durable Objects + D1
  *
- * Routes:
- *  GET  /mini                      -> mini test UI (Telegram WebApp)
- *  POST /api/auth/telegram         -> {initData} => sessionToken
- *  POST /api/room/create           -> create invite room (auth)
+ * HTTP:
+ *  GET  /mini                      -> mini WebApp UI (for testing)
+ *  POST /api/auth/telegram         -> { initData } -> sessionToken
+ *  POST /api/matchmaking           -> (auth) { mode, deckSize, maxPlayers } -> queued/matched
  *  WS   /ws/<roomId>               -> gameplay websocket
- *  GET  /env-check                 -> quick check bindings
- *  GET  /d1-test                   -> quick d1 check
+ *  GET  /env-check                 -> check bindings/secrets
+ *  GET  /d1-test                   -> D1 sanity check
  *
- * Bindings required:
- *  - Secrets: BOT_TOKEN, APP_SECRET
- *  - D1: DB
- *  - Durable Objects: ROOM -> RoomDO
+ * Bindings (wrangler.toml):
+ *  [vars] (or secrets)
+ *    BOT_TOKEN, APP_SECRET
+ *  [[d1_databases]]
+ *    binding = "DB"
+ *  [[durable_objects.bindings]]
+ *    name = "MM"   class_name = "MatchmakerDO"
+ *  [[durable_objects.bindings]]
+ *    name = "ROOM" class_name = "RoomDO"
  */
 
 export interface Env {
   BOT_TOKEN: string
   APP_SECRET: string
   DB: D1Database
+  MM: DurableObjectNamespace
   ROOM: DurableObjectNamespace
 }
 
-/* --------------------------- HTTP helpers --------------------------- */
+/* --------------------------- helpers --------------------------- */
 
 type Json = any
 
@@ -47,8 +53,12 @@ function ok(data: Json = {}) {
 function bad(status: number, message: string, extra?: Json) {
   return json({ ok: false, error: message, ...(extra || {}) }, status)
 }
+function getBearer(request: Request): string {
+  const auth = request.headers.get("authorization") || ""
+  return auth.startsWith("Bearer ") ? auth.slice(7) : ""
+}
 
-/* --------------------------- Crypto helpers --------------------------- */
+/* --------------------------- crypto utils --------------------------- */
 
 async function hmacSha256Raw(keyBytes: Uint8Array, data: string): Promise<ArrayBuffer> {
   const keyBuf = keyBytes.buffer.slice(
@@ -105,12 +115,6 @@ function parseInitData(initData: string): Record<string, string> {
   return out
 }
 
-/**
- * Telegram WebApp initData validation:
- * data_check_string = sorted key=value (except hash) joined by '\n'
- * secret_key bytes = HMAC_SHA256("WebAppData", bot_token)
- * expected_hash = HEX(HMAC_SHA256(secret_key, data_check_string))
- */
 async function validateTelegramInitData(
   initData: string,
   botToken: string
@@ -148,7 +152,7 @@ async function validateTelegramInitData(
   return { ok: true, user }
 }
 
-/* --------------------------- Session token (signed payload) --------------------------- */
+/* --------------------------- session token --------------------------- */
 
 type SessionPayload = {
   tg_id: string
@@ -179,12 +183,8 @@ async function verifySession(token: string, appSecret: string): Promise<SessionP
     return null
   }
 }
-function getBearer(request: Request): string {
-  const auth = request.headers.get("authorization") || ""
-  return auth.startsWith("Bearer ") ? auth.slice(7) : ""
-}
 
-/* --------------------------- D1 schema (optional) --------------------------- */
+/* --------------------------- D1 minimal users table --------------------------- */
 
 async function ensureSchema(env: Env) {
   await env.DB.prepare(`
@@ -193,44 +193,32 @@ async function ensureSchema(env: Env) {
       tg_id TEXT NOT NULL UNIQUE,
       first_name TEXT,
       username TEXT,
-      language_code TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     )
   `).run()
-  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_users_tg_id ON users(tg_id)`).run()
 }
+
 async function upsertUser(env: Env, user: any) {
   const now = Date.now()
   await env.DB.prepare(
     `
-    INSERT INTO users (tg_id, first_name, username, language_code, created_at, updated_at)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+    INSERT INTO users (tg_id, first_name, username, created_at, updated_at)
+    VALUES (?1, ?2, ?3, ?4, ?4)
     ON CONFLICT(tg_id) DO UPDATE SET
       first_name=excluded.first_name,
       username=excluded.username,
-      language_code=excluded.language_code,
       updated_at=excluded.updated_at
     `
   )
-    .bind(
-      String(user.id),
-      user.first_name ?? null,
-      user.username ?? null,
-      user.language_code ?? null,
-      now
-    )
+    .bind(String(user.id), user.first_name ?? null, user.username ?? null, now)
     .run()
 }
 
-/* --------------------------- Durak types + engine helpers --------------------------- */
+/* --------------------------- Durak engine types --------------------------- */
 
 type Mode = "podkidnoy" | "perevodnoy"
 type DeckSize = 24 | 36
-
-type RoomPhase = "lobby" | "playing" | "finished"
-type GamePhase = "playing" | "finished"
-
 type Suit = "S" | "H" | "D" | "C"
 type Rank = 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 // J=11 Q=12 K=13 A=14
 type Card = string // e.g. "H9", "SJ", "DA"
@@ -242,28 +230,13 @@ type RoomConfig = {
   maxPlayers: 2 | 3 | 4
 }
 
-type LobbyPlayer = {
-  id: string
-  name: string
-  username?: string
-  connected: boolean
-  ready: boolean
-}
-
-type RoomMeta = {
-  roomId: string
-  hostId: string
-  config: RoomConfig
-  createdAt: number
-}
-
 type GameState = {
-  phase: GamePhase
   roomId: string
   config: RoomConfig
+  phase: "playing" | "finished"
 
   order: string[] // seating order
-  active: Record<string, boolean> // still in game
+  active: Record<string, boolean>
 
   deck: Card[]
   trumpSuit: Suit
@@ -277,12 +250,10 @@ type GameState = {
   defenderId: string
 
   roundLimit: number
-  passed: string[] // attackers who passed
+  passed: string[]
   takeDeclared: boolean
 
-  winner: string | null
   loser: string | null
-
   updatedAt: number
 }
 
@@ -336,6 +307,12 @@ function sortBySuitThenRank(a: Card, b: Card) {
   if (pa.suit !== pb.suit) return pa.suit < pb.suit ? -1 : 1
   return pa.rank - pb.rank
 }
+function removeCard(hand: Card[], card: Card): boolean {
+  const idx = hand.indexOf(card)
+  if (idx === -1) return false
+  hand.splice(idx, 1)
+  return true
+}
 function cardBeats(defCard: Card, atkCard: Card, trumpSuit: Suit): boolean {
   const d = parseCard(defCard)
   const a = parseCard(atkCard)
@@ -370,22 +347,6 @@ function isNeedDefense(table: TablePair[]): boolean {
 function isFullyDefended(table: TablePair[]): boolean {
   return table.length > 0 && table.every((p) => !!p.d)
 }
-function removeCard(hand: Card[], card: Card): boolean {
-  const idx = hand.indexOf(card)
-  if (idx === -1) return false
-  hand.splice(idx, 1)
-  return true
-}
-function lowestTrumpRank(hand: Card[], trumpSuit: Suit): Rank | null {
-  let best: Rank | null = null
-  for (const c of hand) {
-    const p = parseCard(c)
-    if (!p) continue
-    if (p.suit !== trumpSuit) continue
-    if (best === null || p.rank < best) best = p.rank
-  }
-  return best
-}
 function nextActiveId(order: string[], active: Record<string, boolean>, fromId: string): string {
   const n = order.length
   const start = order.indexOf(fromId)
@@ -400,41 +361,47 @@ function nextActiveId(order: string[], active: Record<string, boolean>, fromId: 
 function listAttackers(order: string[], active: Record<string, boolean>, defenderId: string): string[] {
   return order.filter((id) => active[id] && id !== defenderId)
 }
-
-function drawUpTo6(game: GameState, drawOrder: string[]) {
+function lowestTrumpRank(hand: Card[], trumpSuit: Suit): Rank | null {
+  let best: Rank | null = null
+  for (const c of hand) {
+    const p = parseCard(c)
+    if (!p) continue
+    if (p.suit !== trumpSuit) continue
+    if (best === null || p.rank < best) best = p.rank
+  }
+  return best
+}
+function drawUpTo6(g: GameState, drawOrder: string[]) {
   for (const pid of drawOrder) {
-    const hand = game.hands[pid]
-    while (hand.length < 6 && game.deck.length > 0) {
-      const c = game.deck.pop()!
+    const hand = g.hands[pid]
+    while (hand.length < 6 && g.deck.length > 0) {
+      const c = g.deck.pop()!
       hand.push(c)
     }
     hand.sort(sortBySuitThenRank)
   }
 }
-function pruneOutPlayers(game: GameState) {
-  if (game.deck.length > 0) return
-  for (const id of game.order) {
-    if (!game.active[id]) continue
-    if (game.hands[id].length === 0) game.active[id] = false
+function pruneOutPlayers(g: GameState) {
+  if (g.deck.length > 0) return
+  for (const id of g.order) {
+    if (!g.active[id]) continue
+    if (g.hands[id].length === 0) g.active[id] = false
   }
-  const alive = game.order.filter((id) => game.active[id])
+  const alive = g.order.filter((id) => g.active[id])
   if (alive.length === 1) {
-    game.phase = "finished"
-    game.loser = alive[0]
-    game.winner = "OTHERS"
+    g.phase = "finished"
+    g.loser = alive[0]
   } else if (alive.length === 0) {
-    game.phase = "finished"
-    game.loser = null
-    game.winner = "DRAW"
+    g.phase = "finished"
+    g.loser = null
   }
 }
 
-/* --------------------------- Worker --------------------------- */
+/* --------------------------- Worker routes --------------------------- */
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url)
-
     if (request.method === "OPTIONS") return new Response(null, { status: 204 })
 
     if (url.pathname === "/") return new Response("OK", { status: 200 })
@@ -454,10 +421,9 @@ export default {
       return json({
         ok: true,
         hasBOT_TOKEN: !!env.BOT_TOKEN,
-        botTokenLen: env.BOT_TOKEN?.length ?? 0,
         hasAPP_SECRET: !!env.APP_SECRET,
-        appSecretLen: env.APP_SECRET?.length ?? 0,
         hasDB: !!env.DB,
+        hasMM: !!env.MM,
         hasROOM: !!env.ROOM,
       })
     }
@@ -484,7 +450,6 @@ export default {
 
         const body = (await request.json().catch(() => ({}))) as { initData?: string }
         const initData = String(body.initData ?? "")
-
         const v = await validateTelegramInitData(initData, env.BOT_TOKEN)
         if (!v.ok) return bad(401, v.error || "auth failed")
 
@@ -498,7 +463,6 @@ export default {
           iat: now,
           exp: now + 2 * 60 * 60 * 1000,
         }
-
         const sessionToken = await signSession(payload, env.APP_SECRET)
         return ok({
           sessionToken,
@@ -506,8 +470,8 @@ export default {
         })
       }
 
-      // POST /api/room/create
-      if (url.pathname === "/api/room/create" && request.method === "POST") {
+      // POST /api/matchmaking
+      if (url.pathname === "/api/matchmaking" && request.method === "POST") {
         const token = getBearer(request)
         const session = await verifySession(token, env.APP_SECRET)
         if (!session) return bad(401, "invalid session")
@@ -519,29 +483,24 @@ export default {
         const maxPlayers: 2 | 3 | 4 =
           body.maxPlayers === 3 ? 3 : body.maxPlayers === 4 ? 4 : 2
 
-        const roomId = crypto.randomUUID()
-        const hostId = String(session.tg_id)
-
-        const config: RoomConfig = { mode, deckSize, maxPlayers }
-        const meta: RoomMeta = { roomId, hostId, config, createdAt: Date.now() }
-
-        const stub = env.ROOM.get(env.ROOM.idFromName(roomId))
-        const initRes = await stub.fetch("https://room/init-lobby", {
+        const stub = env.MM.get(env.MM.idFromName("global"))
+        return stub.fetch("https://mm/match", {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${token}`,
+          },
           body: JSON.stringify({
-            meta,
-            host: {
-              id: hostId,
+            mode,
+            deckSize,
+            maxPlayers,
+            player: {
+              id: String(session.tg_id),
               name: session.first_name || "Player",
               username: session.username || "",
             },
           }),
         })
-        const initData = await initRes.json().catch(() => null)
-        if (!initRes.ok) return json(initData || { ok: false, error: "room init failed" }, initRes.status)
-
-        return ok({ roomId, wsUrl: `/ws/${roomId}`, config })
       }
 
       return bad(404, "route not found")
@@ -551,12 +510,117 @@ export default {
   },
 }
 
-/* --------------------------- RoomDO: WS protocol types --------------------------- */
+/* --------------------------- MatchmakerDO --------------------------- */
+
+type MMReq = {
+  mode: Mode
+  deckSize: DeckSize
+  maxPlayers: 2 | 3 | 4
+  player: { id: string; name: string; username?: string }
+}
+
+type MMQueue = Record<string, string[]> // key -> array of tg_id
+type MMMatch = { roomId: string; expiresAt: number }
+
+export class MatchmakerDO {
+  private state: DurableObjectState
+  private env: Env
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state
+    this.env = env
+  }
+
+  private async loadQueue(): Promise<MMQueue> {
+    return (await this.state.storage.get<MMQueue>("queue")) ?? {}
+  }
+  private async saveQueue(q: MMQueue) {
+    await this.state.storage.put("queue", q)
+  }
+
+  private keyOf(cfg: RoomConfig) {
+    return `${cfg.mode}:${cfg.deckSize}:${cfg.maxPlayers}`
+  }
+
+  async fetch(request: Request) {
+    const url = new URL(request.url)
+    if (url.pathname !== "/match" || request.method !== "POST") return bad(404, "not found")
+
+    const token = getBearer(request)
+    const session = await verifySession(token, this.env.APP_SECRET)
+    if (!session) return bad(401, "invalid session")
+    if (session.exp < Date.now()) return bad(401, "session expired")
+
+    const body = (await request.json().catch(() => ({}))) as MMReq
+    const cfg: RoomConfig = {
+      mode: body.mode === "perevodnoy" ? "perevodnoy" : "podkidnoy",
+      deckSize: body.deckSize === 24 ? 24 : 36,
+      maxPlayers: body.maxPlayers === 3 ? 3 : body.maxPlayers === 4 ? 4 : 2,
+    }
+
+    const tgId = String(session.tg_id)
+
+    // If already matched (stored), return it
+    const existing = await this.state.storage.get<MMMatch>(`match:${tgId}`)
+    if (existing && existing.expiresAt > Date.now()) {
+      return ok({ status: "matched", roomId: existing.roomId, wsUrl: `/ws/${existing.roomId}` })
+    }
+
+    const queue = await this.loadQueue()
+    const key = this.keyOf(cfg)
+    const arr = queue[key] ?? []
+
+    // remove duplicates and dead matches
+    const uniq = arr.filter((x) => x && x !== tgId)
+    uniq.push(tgId)
+    queue[key] = uniq
+    await this.saveQueue(queue)
+
+    // Try to match first N
+    const need = cfg.maxPlayers
+    const now = Date.now()
+
+    const refreshed = await this.loadQueue()
+    const cur = refreshed[key] ?? []
+
+    if (cur.length >= need) {
+      const group = cur.slice(0, need)
+      refreshed[key] = cur.slice(need)
+      await this.saveQueue(refreshed)
+
+      const roomId = crypto.randomUUID()
+      const expiresAt = now + 5 * 60 * 1000
+
+      for (const pid of group) {
+        await this.state.storage.put<MMMatch>(`match:${pid}`, { roomId, expiresAt })
+      }
+
+      // init room
+      const stub = this.env.ROOM.get(this.env.ROOM.idFromName(roomId))
+      await stub.fetch("https://room/init", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          roomId,
+          config: cfg,
+          players: group,
+        }),
+      })
+
+      // If current user in matched group => immediate response
+      if (group.includes(tgId)) {
+        return ok({ status: "matched", roomId, wsUrl: `/ws/${roomId}` })
+      }
+    }
+
+    return ok({ status: "queued" })
+  }
+}
+
+/* --------------------------- RoomDO (hibernatable websockets) --------------------------- */
 
 type ClientMsg =
   | { type: "JOIN"; sessionToken: string }
-  | { type: "READY"; ready: boolean }
-  | { type: "START" }
   | { type: "ATTACK"; card: Card }
   | { type: "DEFEND"; attackIndex: number; card: Card }
   | { type: "TRANSFER"; card: Card }
@@ -570,43 +634,198 @@ type ServerMsg =
   | { type: "INFO"; message: string }
   | { type: "ERROR"; code: string; detail?: string; [k: string]: any }
 
-/* --------------------------- RoomDO: “controllers” inside DO --------------------------- */
-
-class LobbyController {
-  constructor(private doRef: RoomDO) {}
-
-  async onReady(playerId: string, ready: boolean) {
-    const p = this.doRef.lobbyPlayers.find((x) => x.id === playerId)
-    if (!p) return this.doRef.sendErrTo(playerId, "NOT_IN_ROOM")
-    p.ready = !!ready
-    p.connected = true
-    await this.doRef.persist()
-    this.doRef.broadcastStates()
-  }
-
-  async onStart(playerId: string) {
-    const meta = this.doRef.meta
-    if (!meta) return this.doRef.sendErrTo(playerId, "ROOM_NOT_FOUND")
-    if (playerId !== meta.hostId) return this.doRef.sendErrTo(playerId, "ONLY_HOST_CAN_START")
-    if (this.doRef.lobbyPlayers.length < 2) return this.doRef.sendErrTo(playerId, "NEED_2_PLAYERS")
-    if (!this.doRef.lobbyPlayers.every((p) => p.ready)) return this.doRef.sendErrTo(playerId, "NOT_ALL_READY")
-
-    this.doRef.startGame()
-    if (!this.doRef.game) return this.doRef.sendErrTo(playerId, "START_FAILED")
-
-    this.doRef.phase = "playing"
-    await this.doRef.persist()
-    this.doRef.broadcast({ type: "INFO", message: "Game started!" })
-    this.doRef.broadcastStates()
-  }
+type RoomPersisted = {
+  roomId: string
+  config: RoomConfig
+  game: GameState
 }
 
-class GameController {
-  constructor(private doRef: RoomDO) {}
+type WSAttach = { tgId?: string }
 
-  private allAttackersPassed(g: GameState): boolean {
+export class RoomDO {
+  private state: DurableObjectState
+  private env: Env
+  private loaded = false
+
+  private room: RoomPersisted | null = null
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state
+    this.env = env
+  }
+
+  private async loadOnce() {
+    if (this.loaded) return
+    this.room = (await this.state.storage.get<RoomPersisted>("room")) ?? null
+    this.loaded = true
+  }
+
+  private async persist() {
+    if (this.room) await this.state.storage.put("room", this.room)
+  }
+
+  private send(ws: WebSocket, msg: ServerMsg) {
+    try {
+      ws.send(JSON.stringify(msg))
+    } catch {}
+  }
+
+  private broadcast(msg: ServerMsg) {
+    const s = JSON.stringify(msg)
+    for (const ws of this.state.getWebSockets()) {
+      try {
+        ws.send(s)
+      } catch {}
+    }
+  }
+
+  private getAttach(ws: WebSocket): WSAttach {
+    try {
+      return (ws.deserializeAttachment() as WSAttach) || {}
+    } catch {
+      return {}
+    }
+  }
+
+  private setAttach(ws: WebSocket, a: WSAttach) {
+    try {
+      ws.serializeAttachment(a)
+    } catch {}
+  }
+
+  private buildStateFor(tgId: string) {
+    if (!this.room) return { phase: "missing" }
+    const g = this.room.game
+
+    const youHand = (g.hands[tgId] || []).slice()
+    const others = g.order
+      .filter((id) => id !== tgId)
+      .map((id) => ({ id, active: g.active[id], count: (g.hands[id] || []).length }))
+
     const attackers = listAttackers(g.order, g.active, g.defenderId)
-    return attackers.every((id) => g.passed.includes(id))
+    const needDefense = isNeedDefense(g.table)
+    const ranksOnTable = tableRanks(g.table)
+
+    const allowed = {
+      attack: false,
+      defend: false,
+      transfer: false,
+      take: false,
+      beat: false,
+      pass: false,
+    }
+
+    if (g.phase === "playing" && g.active[tgId]) {
+      if (tgId === g.defenderId) {
+        if (!g.takeDeclared) {
+          allowed.defend = needDefense
+          allowed.take = g.table.length > 0
+          allowed.transfer =
+            g.config.mode === "perevodnoy" &&
+            g.table.length > 0 &&
+            !g.table.some((p) => p.d) &&
+            (() => {
+              // defender must have a card with rank matching any attack rank
+              const ranks = attackRanksOnly(g.table)
+              return youHand.some((c) => {
+                const p = parseCard(c)
+                return !!p && ranks.has(p.rank)
+              })
+            })()
+        }
+        allowed.beat = isFullyDefended(g.table) && attackers.every((id) => g.passed.includes(id))
+      } else {
+        const hasPassed = g.passed.includes(tgId)
+        allowed.pass = g.table.length > 0 && !hasPassed
+
+        if (!hasPassed) {
+          if (g.table.length === 0) {
+            allowed.attack = tgId === g.attackerId
+          } else {
+            // can always throw matching ranks on table; and also after TAKE declared
+            allowed.attack = youHand.some((c) => {
+              const p = parseCard(c)
+              return !!p && ranksOnTable.has(p.rank)
+            })
+            // if defender hasn't declared TAKE and there are undefended cards, UI still may attack (your rule),
+            // so we do NOT forbid it here.
+          }
+        }
+      }
+    }
+
+    return {
+      roomId: g.roomId,
+      phase: g.phase,
+      config: g.config,
+      players: g.order,
+      you: tgId,
+      attacker: g.attackerId,
+      defender: g.defenderId,
+      trumpSuit: g.trumpSuit,
+      trumpCard: g.trumpCard,
+      deckCount: g.deck.length,
+      yourHand: youHand,
+      others,
+      table: g.table,
+      discardCount: g.discard.length,
+      takeDeclared: g.takeDeclared,
+      passed: g.passed,
+      allowed,
+      updatedAt: g.updatedAt,
+      loser: g.loser,
+    }
+  }
+
+  private broadcastStates() {
+    for (const ws of this.state.getWebSockets()) {
+      const a = this.getAttach(ws)
+      const tgId = a.tgId
+      if (!tgId) continue
+      this.send(ws, { type: "STATE", state: this.buildStateFor(tgId) })
+    }
+  }
+
+  private validateAttack(g: GameState, playerId: string, card: Card): VResult {
+    if (!g.active[playerId]) return { ok: false, code: "NOT_ACTIVE" }
+    if (playerId === g.defenderId) return { ok: false, code: "DEFENDER_CANNOT_ATTACK" }
+    if (g.passed.includes(playerId)) return { ok: false, code: "YOU_PASSED" }
+    if (!g.hands[playerId].includes(card)) return { ok: false, code: "CARD_NOT_IN_HAND" }
+    if (g.table.length >= g.roundLimit) return { ok: false, code: "ROUND_LIMIT" }
+
+    if (g.table.length === 0) {
+      if (playerId !== g.attackerId) return { ok: false, code: "ONLY_MAIN_ATTACKER_STARTS" }
+      return { ok: true }
+    }
+
+    const p = parseCard(card)
+    if (!p) return { ok: false, code: "BAD_CARD" }
+    const ranks = tableRanks(g.table)
+    if (!ranks.has(p.rank)) return { ok: false, code: "RANK_NOT_ON_TABLE" }
+    return { ok: true }
+  }
+
+  private validateDefend(g: GameState, card: Card, attackIndex: number): VResult {
+    if (attackIndex < 0 || attackIndex >= g.table.length) return { ok: false, code: "BAD_ATTACK_INDEX" }
+    const pair = g.table[attackIndex]
+    if (pair.d) return { ok: false, code: "ALREADY_DEFENDED" }
+    if (!g.hands[g.defenderId].includes(card)) return { ok: false, code: "CARD_NOT_IN_HAND" }
+    if (!cardBeats(card, pair.a, g.trumpSuit)) return { ok: false, code: "DOES_NOT_BEAT" }
+    return { ok: true }
+  }
+
+  private validateTransfer(g: GameState, card: Card): VResult {
+    if (g.config.mode !== "perevodnoy") return { ok: false, code: "MODE_NOT_PEREVODNOY" }
+    if (g.takeDeclared) return { ok: false, code: "TAKE_ALREADY_DECLARED" }
+    if (g.table.length === 0) return { ok: false, code: "NOTHING_TO_TRANSFER" }
+    if (g.table.some((p) => p.d)) return { ok: false, code: "CANNOT_TRANSFER_AFTER_DEFEND" }
+    if (!g.hands[g.defenderId].includes(card)) return { ok: false, code: "CARD_NOT_IN_HAND" }
+
+    const p = parseCard(card)
+    if (!p) return { ok: false, code: "BAD_CARD" }
+    const ranks = attackRanksOnly(g.table)
+    if (!ranks.has(p.rank)) return { ok: false, code: "RANK_MUST_MATCH_ATTACK" }
+    return { ok: true }
   }
 
   private resetRoundVars(g: GameState) {
@@ -663,7 +882,6 @@ class GameController {
     }
     g.table = []
 
-    // draw order: attacker -> around -> defender last
     const drawOrder: string[] = []
     let cur = g.attackerId
     drawOrder.push(cur)
@@ -692,102 +910,58 @@ class GameController {
 
     g.attackerId = newAtk
     g.defenderId = newDef
-
     this.resetRoundVars(g)
     g.updatedAt = Date.now()
   }
 
-  private validateAttack(g: GameState, playerId: string, card: Card): VResult {
-    if (!g.active[playerId]) return { ok: false, code: "NOT_ACTIVE" }
-    if (playerId === g.defenderId) return { ok: false, code: "DEFENDER_CANNOT_ATTACK" }
-    if (g.passed.includes(playerId)) return { ok: false, code: "YOU_PASSED" }
-    if (!g.hands[playerId].includes(card)) return { ok: false, code: "CARD_NOT_IN_HAND" }
-    if (g.table.length >= g.roundLimit) return { ok: false, code: "ROUND_LIMIT" }
-
-    const needDefense = isNeedDefense(g.table)
-    const ranks = tableRanks(g.table)
-
-    if (g.table.length === 0) {
-      if (playerId !== g.attackerId) return { ok: false, code: "ONLY_MAIN_ATTACKER_STARTS" }
-      return { ok: true }
+  private sendErrTo(tgId: string, code: string, detail?: string) {
+    for (const ws of this.state.getWebSockets()) {
+      const a = this.getAttach(ws)
+      if (a.tgId === tgId) this.send(ws, { type: "ERROR", code, detail })
     }
-
-    const p = parseCard(card)
-    if (!p) return { ok: false, code: "BAD_CARD" }
-    if (!ranks.has(p.rank)) return { ok: false, code: "RANK_NOT_ON_TABLE" }
-    if (!g.takeDeclared && needDefense) return { ok: false, code: "DEFENDER_MUST_RESPOND" }
-
-    return { ok: true }
   }
 
-  private validateDefend(g: GameState, card: Card, attackIndex: number): VResult {
-    if (attackIndex < 0 || attackIndex >= g.table.length) return { ok: false, code: "BAD_ATTACK_INDEX" }
-    const pair = g.table[attackIndex]
-    if (pair.d) return { ok: false, code: "ALREADY_DEFENDED" }
-    if (!g.hands[g.defenderId].includes(card)) return { ok: false, code: "CARD_NOT_IN_HAND" }
-    if (!cardBeats(card, pair.a, g.trumpSuit)) return { ok: false, code: "DOES_NOT_BEAT" }
-    return { ok: true }
-  }
-
-  private validateTransfer(g: GameState, card: Card): VResult {
-    if (g.config.mode !== "perevodnoy") return { ok: false, code: "MODE_NOT_PEREVODNOY" }
-    if (g.takeDeclared) return { ok: false, code: "TAKE_ALREADY_DECLARED" }
-    if (g.table.length === 0) return { ok: false, code: "NOTHING_TO_TRANSFER" }
-    if (g.table.some((p) => p.d)) return { ok: false, code: "CANNOT_TRANSFER_AFTER_DEFEND" }
-    if (!g.hands[g.defenderId].includes(card)) return { ok: false, code: "CARD_NOT_IN_HAND" }
-
-    const p = parseCard(card)
-    if (!p) return { ok: false, code: "BAD_CARD" }
-    const ranks = attackRanksOnly(g.table)
-    if (!ranks.has(p.rank)) return { ok: false, code: "RANK_MUST_MATCH_ATTACK" }
-
-    return { ok: true }
-  }
-
-  async onPass(playerId: string, g: GameState) {
-    if (playerId === g.defenderId) return this.doRef.sendErrTo(playerId, "DEFENDER_CANNOT_PASS")
-    if (g.table.length === 0) return this.doRef.sendErrTo(playerId, "NOTHING_ON_TABLE")
-
-    if (!g.passed.includes(playerId)) g.passed.push(playerId)
+  private async onAttack(tgId: string, card: Card) {
+    if (!this.room) return
+    const g = this.room.game
+    if (g.phase !== "playing") return this.sendErrTo(tgId, "GAME_NOT_PLAYING")
+    const v = this.validateAttack(g, tgId, card)
+    if (!v.ok) return this.sendErrTo(tgId, v.code)
+    removeCard(g.hands[tgId], card)
+    g.table.push({ a: card, d: null })
     g.updatedAt = Date.now()
-
-    if (g.takeDeclared && this.allAttackersPassed(g)) {
-      this.endRoundTake(g)
-      await this.doRef.persist()
-      this.doRef.broadcastStates()
-      return
-    }
-
-    await this.doRef.persist()
-    this.doRef.broadcastStates()
+    await this.persist()
+    this.broadcastStates()
   }
 
-  async onTake(playerId: string, g: GameState) {
-    if (playerId !== g.defenderId) return this.doRef.sendErrTo(playerId, "ONLY_DEFENDER_CAN_TAKE")
-    if (g.table.length === 0) return this.doRef.sendErrTo(playerId, "NOTHING_ON_TABLE")
+  private async onDefend(tgId: string, attackIndex: number, card: Card) {
+    if (!this.room) return
+    const g = this.room.game
+    if (g.phase !== "playing") return this.sendErrTo(tgId, "GAME_NOT_PLAYING")
+    if (tgId !== g.defenderId) return this.sendErrTo(tgId, "ONLY_DEFENDER_CAN_DEFEND")
+    if (g.takeDeclared) return this.sendErrTo(tgId, "TAKE_ALREADY_DECLARED")
 
-    g.takeDeclared = true
-    g.passed = []
+    const idx = Number(attackIndex)
+    if (!Number.isInteger(idx)) return this.sendErrTo(tgId, "BAD_ATTACK_INDEX")
+
+    const v = this.validateDefend(g, card, idx)
+    if (!v.ok) return this.sendErrTo(tgId, v.code)
+
+    removeCard(g.hands[g.defenderId], card)
+    g.table[idx].d = card
     g.updatedAt = Date.now()
-
-    await this.doRef.persist()
-    this.doRef.broadcastStates()
+    await this.persist()
+    this.broadcastStates()
   }
 
-  async onBeat(playerId: string, g: GameState) {
-    if (playerId !== g.defenderId) return this.doRef.sendErrTo(playerId, "ONLY_DEFENDER_CAN_BEAT")
-    if (!isFullyDefended(g.table)) return this.doRef.sendErrTo(playerId, "NOT_FULLY_DEFENDED")
-    if (!this.allAttackersPassed(g)) return this.doRef.sendErrTo(playerId, "ATTACKERS_NOT_PASSED")
+  private async onTransfer(tgId: string, card: Card) {
+    if (!this.room) return
+    const g = this.room.game
+    if (g.phase !== "playing") return this.sendErrTo(tgId, "GAME_NOT_PLAYING")
+    if (tgId !== g.defenderId) return this.sendErrTo(tgId, "ONLY_DEFENDER_CAN_TRANSFER")
 
-    this.endRoundBeat(g)
-    await this.doRef.persist()
-    this.doRef.broadcastStates()
-  }
-
-  async onTransfer(playerId: string, g: GameState, card: Card) {
-    if (playerId !== g.defenderId) return this.doRef.sendErrTo(playerId, "ONLY_DEFENDER_CAN_TRANSFER")
     const v = this.validateTransfer(g, card)
-    if (!v.ok) return this.doRef.sendErrTo(playerId, v.code)
+    if (!v.ok) return this.sendErrTo(tgId, v.code)
 
     removeCard(g.hands[g.defenderId], card)
     g.table.push({ a: card, d: null })
@@ -801,147 +975,72 @@ class GameController {
     g.takeDeclared = false
     g.updatedAt = Date.now()
 
-    await this.doRef.persist()
-    this.doRef.broadcastStates()
+    await this.persist()
+    this.broadcastStates()
   }
 
-  async onDefend(playerId: string, g: GameState, attackIndexRaw: any, card: Card) {
-    if (playerId !== g.defenderId) return this.doRef.sendErrTo(playerId, "ONLY_DEFENDER_CAN_DEFEND")
-    if (g.takeDeclared) return this.doRef.sendErrTo(playerId, "TAKE_ALREADY_DECLARED")
+  private async onTake(tgId: string) {
+    if (!this.room) return
+    const g = this.room.game
+    if (g.phase !== "playing") return this.sendErrTo(tgId, "GAME_NOT_PLAYING")
+    if (tgId !== g.defenderId) return this.sendErrTo(tgId, "ONLY_DEFENDER_CAN_TAKE")
+    if (g.table.length === 0) return this.sendErrTo(tgId, "NOTHING_ON_TABLE")
+    g.takeDeclared = true
+    g.passed = []
+    g.updatedAt = Date.now()
+    await this.persist()
+    this.broadcastStates()
+  }
 
-    const attackIndex = typeof attackIndexRaw === "number" ? attackIndexRaw : Number(attackIndexRaw)
-    if (!Number.isInteger(attackIndex)) return this.doRef.sendErrTo(playerId, "BAD_ATTACK_INDEX")
+  private async onPass(tgId: string) {
+    if (!this.room) return
+    const g = this.room.game
+    if (g.phase !== "playing") return this.sendErrTo(tgId, "GAME_NOT_PLAYING")
+    if (tgId === g.defenderId) return this.sendErrTo(tgId, "DEFENDER_CANNOT_PASS")
+    if (g.table.length === 0) return this.sendErrTo(tgId, "NOTHING_ON_TABLE")
 
-    const v = this.validateDefend(g, card, attackIndex)
-    if (!v.ok) return this.doRef.sendErrTo(playerId, v.code)
-
-    removeCard(g.hands[g.defenderId], card)
-    g.table[attackIndex].d = card
+    if (!g.passed.includes(tgId)) g.passed.push(tgId)
     g.updatedAt = Date.now()
 
-    await this.doRef.persist()
-    this.doRef.broadcastStates()
-  }
-
-  async onAttack(playerId: string, g: GameState, card: Card) {
-    const v = this.validateAttack(g, playerId, card)
-    if (!v.ok) return this.doRef.sendErrTo(playerId, v.code)
-
-    removeCard(g.hands[playerId], card)
-    g.table.push({ a: card, d: null })
-    g.updatedAt = Date.now()
-
-    await this.doRef.persist()
-    this.doRef.broadcastStates()
-  }
-}
-
-/* --------------------------- Durable Object: RoomDO --------------------------- */
-
-export class RoomDO {
-  private state: DurableObjectState
-  private env: Env
-
-  // persisted
-  meta: RoomMeta | null = null
-  lobbyPlayers: LobbyPlayer[] = []
-  phase: RoomPhase = "lobby"
-  game: GameState | null = null
-
-  // runtime
-  private loaded = false
-  private sockets = new Map<string, WebSocket>() // tg_id -> ws
-  private lobbyCtl = new LobbyController(this)
-  private gameCtl = new GameController(this)
-
-  constructor(state: DurableObjectState, env: Env) {
-    this.state = state
-    this.env = env
-  }
-
-  /* ----- persistence ----- */
-
-  private async loadOnce() {
-    if (this.loaded) return
-    this.meta = (await this.state.storage.get<RoomMeta>("meta")) ?? null
-    this.lobbyPlayers = (await this.state.storage.get<LobbyPlayer[]>("lobbyPlayers")) ?? []
-    this.phase = (await this.state.storage.get<RoomPhase>("phase")) ?? "lobby"
-    this.game = (await this.state.storage.get<GameState>("game")) ?? null
-    this.loaded = true
-  }
-
-  async persist() {
-    if (this.meta) await this.state.storage.put("meta", this.meta)
-    await this.state.storage.put("lobbyPlayers", this.lobbyPlayers)
-    await this.state.storage.put("phase", this.phase)
-    if (this.game) await this.state.storage.put("game", this.game)
-  }
-
-  /* ----- WS send helpers ----- */
-
-  private send(ws: WebSocket, msg: ServerMsg) {
-    try {
-      ws.send(JSON.stringify(msg))
-    } catch {}
-  }
-  sendErrTo(tgId: string, code: string, detail?: string, extra?: any) {
-    const ws = this.sockets.get(tgId)
-    if (!ws) return
-    this.send(ws, { type: "ERROR", code, detail, ...(extra || {}) })
-  }
-  broadcast(msg: ServerMsg) {
-    const s = JSON.stringify(msg)
-    for (const ws of this.sockets.values()) {
-      try {
-        ws.send(s)
-      } catch {}
-    }
-  }
-
-  /* ----- state helpers ----- */
-
-  private playerName(id: string): string {
-    const p = this.lobbyPlayers.find((x) => x.id === id)
-    return p?.name || id
-  }
-
-  private ensureLobbyPlayer(session: SessionPayload) {
-    const id = String(session.tg_id)
-    const name = session.first_name || "Player"
-    const username = session.username || ""
-
-    const p = this.lobbyPlayers.find((x) => x.id === id)
-    if (p) {
-      p.name = name
-      p.username = username
-      p.connected = true
-      return p
+    // if defender declared TAKE and all attackers passed -> end round take
+    const attackers = listAttackers(g.order, g.active, g.defenderId)
+    const allPassed = attackers.every((id) => g.passed.includes(id))
+    if (g.takeDeclared && allPassed) {
+      this.endRoundTake(g)
     }
 
-    const np: LobbyPlayer = { id, name, username, connected: true, ready: false }
-    this.lobbyPlayers.push(np)
-    return np
+    await this.persist()
+    this.broadcastStates()
   }
 
-  startGame() {
-    if (!this.meta) return
-    const config = this.meta.config
-    const players = this.lobbyPlayers.map((p) => p.id).slice(0, config.maxPlayers)
-    if (players.length < 2) return
+  private async onBeat(tgId: string) {
+    if (!this.room) return
+    const g = this.room.game
+    if (g.phase !== "playing") return this.sendErrTo(tgId, "GAME_NOT_PLAYING")
+    if (tgId !== g.defenderId) return this.sendErrTo(tgId, "ONLY_DEFENDER_CAN_BEAT")
+    if (!isFullyDefended(g.table)) return this.sendErrTo(tgId, "NOT_FULLY_DEFENDED")
+    const attackers = listAttackers(g.order, g.active, g.defenderId)
+    if (!attackers.every((id) => g.passed.includes(id))) return this.sendErrTo(tgId, "ATTACKERS_NOT_PASSED")
 
-    const order = players.slice()
+    this.endRoundBeat(g)
+    await this.persist()
+    this.broadcastStates()
+  }
+
+  private initGame(roomId: string, cfg: RoomConfig, players: string[]) {
+    const order = players.slice(0, cfg.maxPlayers)
     const active: Record<string, boolean> = {}
     const hands: Record<string, Card[]> = {}
+
     for (const id of order) {
       active[id] = true
       hands[id] = []
     }
 
-    const deck = shuffle(createDeck(config.deckSize))
+    const deck = shuffle(createDeck(cfg.deckSize))
     const trumpCard = deck[0]
     const trumpSuit = parseCard(trumpCard)!.suit
 
-    // deal 6 each from end
     for (let i = 0; i < 6; i++) {
       for (const pid of order) {
         const c = deck.pop()
@@ -950,7 +1049,6 @@ export class RoomDO {
     }
     for (const pid of order) hands[pid].sort(sortBySuitThenRank)
 
-    // first attacker = lowest trump (else order[0])
     let attackerId = order[0]
     let best: Rank | null = null
     let bestId: string | null = null
@@ -966,10 +1064,10 @@ export class RoomDO {
 
     const defenderId = nextActiveId(order, active, attackerId)
 
-    this.game = {
+    const game: GameState = {
+      roomId,
+      config: cfg,
       phase: "playing",
-      roomId: this.meta.roomId,
-      config,
       order,
       active,
       deck,
@@ -983,160 +1081,33 @@ export class RoomDO {
       roundLimit: hands[defenderId].length,
       passed: [],
       takeDeclared: false,
-      winner: null,
       loser: null,
       updatedAt: Date.now(),
     }
+
+    this.room = { roomId, config: cfg, game }
   }
-
-  private buildStateFor(playerId: string) {
-    if (!this.meta) return { phase: "lobby", roomId: null }
-
-    if (this.phase === "lobby") {
-      return {
-        phase: "lobby",
-        roomId: this.meta.roomId,
-        hostId: this.meta.hostId,
-        config: this.meta.config,
-        you: playerId,
-        players: this.lobbyPlayers.map((p) => ({
-          id: p.id,
-          name: p.name,
-          username: p.username || "",
-          ready: p.ready,
-          connected: p.connected,
-        })),
-      }
-    }
-
-    const g = this.game
-    if (!g) return { phase: this.phase, roomId: this.meta.roomId, error: "game missing" }
-
-    const youHand = (g.hands[playerId] || []).slice()
-    const others = g.order
-      .filter((id) => id !== playerId)
-      .map((id) => ({
-        id,
-        name: this.playerName(id),
-        active: g.active[id],
-        count: (g.hands[id] || []).length,
-      }))
-
-    const attackers = listAttackers(g.order, g.active, g.defenderId)
-    const needDefense = isNeedDefense(g.table)
-    const ranksOnTable = tableRanks(g.table)
-
-    const allowed = {
-      ready: false,
-      start: false,
-      attack: false,
-      defend: false,
-      transfer: false,
-      take: false,
-      beat: false,
-      pass: false,
-    }
-
-    if (g.phase === "playing") {
-      const youActive = !!g.active[playerId]
-      if (youActive) {
-        if (playerId === g.defenderId) {
-          if (!g.takeDeclared) {
-            allowed.defend = needDefense
-            allowed.take = g.table.length > 0
-            allowed.transfer =
-              g.config.mode === "perevodnoy" &&
-              g.table.length > 0 &&
-              !g.table.some((p) => p.d)
-          }
-          allowed.beat = isFullyDefended(g.table) && attackers.every((id) => g.passed.includes(id))
-        } else {
-          const hasPassed = g.passed.includes(playerId)
-          allowed.pass = g.table.length > 0 && !hasPassed
-
-          if (!hasPassed) {
-            if (g.table.length === 0) {
-              allowed.attack = playerId === g.attackerId
-            } else {
-              const canByRankAny = (hand: Card[]) =>
-                hand.some((card) => {
-                  const p = parseCard(card)
-                  return !!p && ranksOnTable.has(p.rank)
-                })
-              allowed.attack = canByRankAny(youHand)
-              if (!g.takeDeclared && needDefense) allowed.attack = false
-            }
-          }
-        }
-      }
-    }
-
-    return {
-      phase: g.phase,
-      roomId: g.roomId,
-      config: g.config,
-      you: playerId,
-      order: g.order.map((id) => ({ id, name: this.playerName(id), active: g.active[id] })),
-      attackerId: g.attackerId,
-      defenderId: g.defenderId,
-      attackerName: this.playerName(g.attackerId),
-      defenderName: this.playerName(g.defenderId),
-      deckCount: g.deck.length,
-      trumpSuit: g.trumpSuit,
-      trumpCard: g.trumpCard,
-      yourHand: youHand,
-      others,
-      table: g.table,
-      discardCount: g.discard.length,
-      passed: g.passed,
-      takeDeclared: g.takeDeclared,
-      needDefense,
-      roundLimit: g.roundLimit,
-      allowed,
-      loser: g.loser,
-      updatedAt: g.updatedAt,
-    }
-  }
-
-  broadcastStates() {
-    for (const [tgId] of this.sockets.entries()) {
-      const st = this.buildStateFor(tgId)
-      const ws = this.sockets.get(tgId)
-      if (ws) this.send(ws, { type: "STATE", state: st })
-    }
-  }
-
-  /* ----- Durable Object fetch ----- */
 
   async fetch(request: Request) {
     await this.loadOnce()
     const url = new URL(request.url)
 
-    // init lobby
-    if (url.pathname === "/init-lobby" && request.method === "POST") {
+    // init from matchmaker
+    if (url.pathname === "/init" && request.method === "POST") {
       const body = (await request.json().catch(() => ({}))) as {
-        meta?: RoomMeta
-        host?: { id: string; name: string; username?: string }
+        roomId?: string
+        config?: RoomConfig
+        players?: string[]
       }
-      if (!body.meta || !body.host) return bad(400, "bad init-lobby")
-
-      this.meta = body.meta
-      this.phase = "lobby"
-      this.game = null
-      this.lobbyPlayers = [
-        {
-          id: String(body.host.id),
-          name: body.host.name || "Host",
-          username: body.host.username || "",
-          connected: false,
-          ready: false,
-        },
-      ]
+      if (!body.roomId || !body.config || !Array.isArray(body.players) || body.players.length < 2) {
+        return bad(400, "bad init")
+      }
+      this.initGame(body.roomId, body.config, body.players)
       await this.persist()
-      return ok({ roomId: this.meta.roomId })
+      return ok({ roomId: body.roomId })
     }
 
-    // websocket only
+    // websocket
     if (request.headers.get("Upgrade") !== "websocket") return bad(426, "Expected websocket")
 
     const pair = new WebSocketPair()
@@ -1144,157 +1115,99 @@ export class RoomDO {
     const server = pair[1]
     server.accept()
 
-    let boundId: string | null = null
+    // IMPORTANT: make it hibernatable
+    this.state.acceptWebSocket(server)
 
-    const sendErr = (code: string, detail?: string, extra?: any) => {
-      this.send(server, { type: "ERROR", code, detail, ...(extra || {}) })
-    }
-
-    server.addEventListener("message", (ev) => {
-      this.state.waitUntil(
-        (async () => {
-          let msg: ClientMsg
-          try {
-            msg = JSON.parse(String(ev.data))
-          } catch {
-            sendErr("BAD_JSON")
-            return
-          }
-
-          // JOIN
-          if (msg.type === "JOIN") {
-            if (!this.meta) {
-              sendErr("ROOM_NOT_FOUND")
-              try { server.close(1008, "Room not found") } catch {}
-              return
-            }
-
-            const token = String((msg as any).sessionToken ?? "")
-            const session = await verifySession(token, this.env.APP_SECRET)
-            if (!session) {
-              sendErr("BAD_SESSION")
-              try { server.close(1008, "Bad session") } catch {}
-              return
-            }
-            if (session.exp < Date.now()) {
-              sendErr("SESSION_EXPIRED")
-              try { server.close(1008, "Expired") } catch {}
-              return
-            }
-
-            const tgId = String(session.tg_id)
-            boundId = tgId
-
-            // replace old socket for same user
-            const prev = this.sockets.get(tgId)
-            if (prev && prev !== server) {
-              try { prev.close(1012, "Replaced") } catch {}
-            }
-            this.sockets.set(tgId, server)
-
-            if (this.phase === "lobby") {
-              if (this.lobbyPlayers.length >= this.meta.config.maxPlayers) {
-                const exists = this.lobbyPlayers.some((p) => p.id === tgId)
-                if (!exists) {
-                  sendErr("ROOM_FULL")
-                  try { server.close(1008, "Room full") } catch {}
-                  return
-                }
-              }
-              this.ensureLobbyPlayer(session).connected = true
-              await this.persist()
-              this.broadcastStates()
-              return
-            }
-
-            if (!this.game || !this.game.order.includes(tgId)) {
-              sendErr("NOT_IN_GAME")
-              try { server.close(1008, "Not in game") } catch {}
-              return
-            }
-
-            await this.persist()
-            this.broadcastStates()
-            return
-          }
-
-          // must be joined
-          if (!boundId) {
-            sendErr("NOT_JOINED")
-            return
-          }
-          if (!this.meta) {
-            sendErr("ROOM_NOT_FOUND")
-            return
-          }
-
-          // LOBBY
-          if (this.phase === "lobby") {
-            if (msg.type === "READY") return this.lobbyCtl.onReady(boundId, !!(msg as any).ready)
-            if (msg.type === "START") return this.lobbyCtl.onStart(boundId)
-            sendErr("UNKNOWN_LOBBY_MSG")
-            return
-          }
-
-          // GAME
-          if (!this.game) {
-            sendErr("GAME_NOT_READY")
-            return
-          }
-          const g = this.game
-
-          if (g.phase === "finished") {
-            this.broadcastStates()
-            sendErr("GAME_FINISHED", undefined, { loser: g.loser })
-            return
-          }
-
-          if (!g.active[boundId]) {
-            sendErr("YOU_ARE_OUT")
-            this.broadcastStates()
-            return
-          }
-
-          if (msg.type === "PASS") return this.gameCtl.onPass(boundId, g)
-          if (msg.type === "TAKE") return this.gameCtl.onTake(boundId, g)
-          if (msg.type === "BEAT") return this.gameCtl.onBeat(boundId, g)
-          if (msg.type === "TRANSFER") return this.gameCtl.onTransfer(boundId, g, String((msg as any).card ?? ""))
-          if (msg.type === "DEFEND") return this.gameCtl.onDefend(boundId, g, (msg as any).attackIndex, String((msg as any).card ?? ""))
-          if (msg.type === "ATTACK") return this.gameCtl.onAttack(boundId, g, String((msg as any).card ?? ""))
-
-          sendErr("UNKNOWN_MSG")
-        })()
-      )
-    })
-
-    server.addEventListener("close", () => {
-      if (!boundId) return
-      const ws = this.sockets.get(boundId)
-      if (ws === server) this.sockets.delete(boundId)
-
-      const p = this.lobbyPlayers.find((x) => x.id === boundId)
-      if (p) p.connected = false
-
-      this.state.waitUntil(
-        (async () => {
-          await this.persist()
-          this.broadcastStates()
-        })()
-      )
-    })
+    // we don't know tgId until JOIN
+    this.setAttach(server, {})
 
     return new Response(null, { status: 101, webSocket: client })
   }
+
+  // Hibernatable WS handlers
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    await this.loadOnce()
+
+    let msg: ClientMsg
+    try {
+      msg = JSON.parse(typeof message === "string" ? message : new TextDecoder().decode(message))
+    } catch {
+      return this.send(ws, { type: "ERROR", code: "BAD_JSON" })
+    }
+
+    // JOIN
+    if (msg.type === "JOIN") {
+      if (!this.room) {
+        this.send(ws, { type: "ERROR", code: "ROOM_NOT_READY" })
+        try {
+          ws.close(1008, "Room not ready")
+        } catch {}
+        return
+      }
+      const token = String((msg as any).sessionToken ?? "")
+      const session = await verifySession(token, this.env.APP_SECRET)
+      if (!session) {
+        this.send(ws, { type: "ERROR", code: "BAD_SESSION" })
+        try {
+          ws.close(1008, "Bad session")
+        } catch {}
+        return
+      }
+      if (session.exp < Date.now()) {
+        this.send(ws, { type: "ERROR", code: "SESSION_EXPIRED" })
+        try {
+          ws.close(1008, "Expired")
+        } catch {}
+        return
+      }
+
+      const tgId = String(session.tg_id)
+      this.setAttach(ws, { tgId })
+
+      // send state immediately (only to this ws)
+      this.send(ws, { type: "STATE", state: this.buildStateFor(tgId) })
+      // and broadcast to all (so both update)
+      this.broadcastStates()
+      return
+    }
+
+    const a = this.getAttach(ws)
+    const tgId = a.tgId
+    if (!tgId) {
+      return this.send(ws, { type: "ERROR", code: "NOT_JOINED" })
+    }
+
+    if (!this.room) return this.send(ws, { type: "ERROR", code: "ROOM_NOT_READY" })
+
+    // gameplay
+    if (msg.type === "ATTACK") return this.onAttack(tgId, String((msg as any).card ?? ""))
+    if (msg.type === "DEFEND")
+      return this.onDefend(tgId, Number((msg as any).attackIndex), String((msg as any).card ?? ""))
+    if (msg.type === "TRANSFER") return this.onTransfer(tgId, String((msg as any).card ?? ""))
+    if (msg.type === "TAKE") return this.onTake(tgId)
+    if (msg.type === "PASS") return this.onPass(tgId)
+    if (msg.type === "BEAT") return this.onBeat(tgId)
+
+    this.send(ws, { type: "ERROR", code: "UNKNOWN_MSG" })
+  }
+
+  async webSocketClose(ws: WebSocket) {
+    // nothing critical; state.getWebSockets() will keep correct list
+  }
+
+  async webSocketError(ws: WebSocket, err: unknown) {
+    // ignore
+  }
 }
 
-/* --------------------------- Mini HTML UI --------------------------- */
+/* --------------------------- Mini UI (/mini) --------------------------- */
 
 const MINI_HTML = `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Durak 2-4</title>
+  <title>Durak MM</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
     body{font-family:system-ui,sans-serif;padding:14px}
@@ -1313,13 +1226,15 @@ const MINI_HTML = `<!doctype html>
   </style>
 </head>
 <body>
-  <h2>Durak 2–4 (Invite Rooms)</h2>
+  <h2>Durak (Matchmaking + WS)</h2>
 
   <div class="box">
     <div class="row">
       <button id="btnAuth">1) Auth</button>
-      <button id="btnCreate" disabled>2) Create room</button>
+      <button id="btnMM" disabled>2) Matchmaking</button>
+      <button id="btnConnect" disabled>3) Connect WS</button>
     </div>
+
     <div class="row">
       <label>Mode:
         <select id="mode">
@@ -1341,23 +1256,20 @@ const MINI_HTML = `<!doctype html>
         </select>
       </label>
     </div>
+
     <div class="row">
-      <input id="roomInput" placeholder="roomId (paste to join)" style="min-width:320px"/>
-      <button id="btnConnect" disabled>3) Connect WS</button>
+      <input id="roomInput" placeholder="roomId" style="min-width:320px"/>
     </div>
-    <div class="small">Создал комнату → скопируй roomId → отправь друзьям → они вставят и подключатся.</div>
   </div>
 
   <div class="box">
     <div class="row">
-      <button id="btnReady" disabled>READY</button>
-      <button id="btnStart" disabled>START (host)</button>
       <button id="btnPass" disabled>PASS</button>
       <button id="btnTake" disabled>TAKE</button>
       <button id="btnBeat" disabled>BEAT</button>
       <button id="btnTransfer" disabled>TRANSFER (select card)</button>
     </div>
-    <div class="small">DEFEND: click A# on table, then click a card in hand.</div>
+    <div class="small">DEFEND: click A# on table, then click card in hand. ATTACK: just click card in hand.</div>
   </div>
 
   <div class="box">
@@ -1373,8 +1285,8 @@ const MINI_HTML = `<!doctype html>
   </div>
 
   <div class="box">
-    <div><b>Players / Others</b></div>
-    <pre id="players">-</pre>
+    <div><b>Others</b></div>
+    <pre id="others">-</pre>
   </div>
 
   <div class="box">
@@ -1387,7 +1299,7 @@ const MINI_HTML = `<!doctype html>
     <div id="hand" class="row"></div>
   </div>
 
-  <pre id="log">Open inside Telegram WebApp.</pre>
+  <pre id="log">Open inside Telegram WebApp (Mini App). Use console in Telegram Desktop if needed.</pre>
 
 <script>
   const logEl = document.getElementById("log");
@@ -1398,16 +1310,14 @@ const MINI_HTML = `<!doctype html>
   const attEl = document.getElementById("att");
   const defEl = document.getElementById("def");
   const statusEl = document.getElementById("status");
-  const playersEl = document.getElementById("players");
+  const othersEl = document.getElementById("others");
 
   const tableEl = document.getElementById("table");
   const handEl = document.getElementById("hand");
 
   const btnAuth = document.getElementById("btnAuth");
-  const btnCreate = document.getElementById("btnCreate");
+  const btnMM = document.getElementById("btnMM");
   const btnConnect = document.getElementById("btnConnect");
-  const btnReady = document.getElementById("btnReady");
-  const btnStart = document.getElementById("btnStart");
   const btnPass = document.getElementById("btnPass");
   const btnTake = document.getElementById("btnTake");
   const btnBeat = document.getElementById("btnBeat");
@@ -1449,34 +1359,18 @@ const MINI_HTML = `<!doctype html>
     youEl.textContent = st.you || "-";
     phaseEl.textContent = st.phase || "-";
     trumpEl.textContent = st.trumpSuit ? (st.trumpSuit + " (" + st.trumpCard + ")") : "-";
-    attEl.textContent = st.attackerName ? (st.attackerName + " [" + st.attackerId + "]") : "-";
-    defEl.textContent = st.defenderName ? (st.defenderName + " [" + st.defenderId + "]") : "-";
+    attEl.textContent = st.attacker || "-";
+    defEl.textContent = st.defender || "-";
 
-    if (st.phase === "lobby"){
-      playersEl.textContent = JSON.stringify(st.players || [], null, 2);
-      btnReady.disabled = false;
-      btnStart.disabled = !(st.hostId === st.you);
-      btnPass.disabled = true;
-      btnTake.disabled = true;
-      btnBeat.disabled = true;
-      btnTransfer.disabled = true;
-      tableEl.innerHTML = "";
-      handEl.innerHTML = "";
-      setStatus("Lobby: READY then host START");
-      return;
-    }
-
-    playersEl.textContent = JSON.stringify({ order: st.order, others: st.others }, null, 2);
+    othersEl.textContent = JSON.stringify(st.others || [], null, 2);
 
     const a = (st.allowed || {});
-    btnReady.disabled = true;
-    btnStart.disabled = true;
     btnPass.disabled = !a.pass;
     btnTake.disabled = !a.take;
     btnBeat.disabled = !a.beat;
     btnTransfer.disabled = !a.transfer;
 
-    setStatus("deck=" + st.deckCount + " table=" + (st.table?st.table.length:0) + " needDefense=" + st.needDefense);
+    setStatus("deck=" + st.deckCount + " table=" + (st.table?st.table.length:0) + " take=" + !!st.takeDeclared);
 
     tableEl.innerHTML = "";
     selectedAttackIndex = (selectedAttackIndex !== null && st.table && st.table[selectedAttackIndex]) ? selectedAttackIndex : null;
@@ -1496,12 +1390,12 @@ const MINI_HTML = `<!doctype html>
       btn.onclick = () => {
         selectedCard = c;
 
-        if (st.you === st.defenderId && selectedAttackIndex !== null && st.allowed && st.allowed.defend){
+        // If defender and user selected attackIndex and defend allowed -> DEFEND
+        if (st.you === st.defender && selectedAttackIndex !== null && st.allowed && st.allowed.defend){
           wsSend({ type:"DEFEND", attackIndex:selectedAttackIndex, card:c });
         } else {
           wsSend({ type:"ATTACK", card:c });
         }
-
         renderState(lastState);
       };
       handEl.appendChild(btn);
@@ -1522,25 +1416,24 @@ const MINI_HTML = `<!doctype html>
       setLog(JSON.stringify(data, null, 2));
       if (data.ok && data.sessionToken) {
         sessionToken = data.sessionToken;
-        btnCreate.disabled = false;
-        btnConnect.disabled = false;
-        log("Auth OK. sessionToken saved.");
+        btnMM.disabled = false;
+        log("Auth OK.");
       }
     }catch(e){
       setLog("Auth error: " + (e?.message || String(e)));
     }
   };
 
-  btnCreate.onclick = async () => {
+  btnMM.onclick = async () => {
     try{
       if (!sessionToken) { log("Auth first"); return; }
+      setStatus("Matchmaking...");
       const payload = {
         mode: modeSel.value,
         deckSize: Number(deckSel.value),
         maxPlayers: Number(maxPlayersSel.value)
       };
-      log("Creating room...", payload);
-      const r = await fetch("/api/room/create", {
+      const r = await fetch("/api/matchmaking", {
         method:"POST",
         headers:{
           "content-type":"application/json",
@@ -1550,13 +1443,16 @@ const MINI_HTML = `<!doctype html>
       });
       const data = await r.json();
       log(data);
-      if (data.ok && data.roomId){
+      if (data.ok && data.status === "matched") {
         roomId = data.roomId;
         roomInput.value = roomId;
-        log("Room created. Share roomId:", roomId);
+        btnConnect.disabled = false;
+        setStatus("Matched!");
+      } else {
+        setStatus("Queued (open another client and press Matchmaking too)");
       }
     }catch(e){
-      log("Create error:", e?.message || String(e));
+      log("MM error:", e?.message || String(e));
     }
   };
 
@@ -1564,7 +1460,7 @@ const MINI_HTML = `<!doctype html>
     try{
       if (!sessionToken) { log("Auth first"); return; }
       roomId = roomInput.value.trim();
-      if (!roomId) { log("Paste roomId"); return; }
+      if (!roomId) { log("No roomId"); return; }
 
       const wsUrl = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/" + roomId;
       log("Connecting WS:", wsUrl);
@@ -1597,8 +1493,6 @@ const MINI_HTML = `<!doctype html>
     }
   };
 
-  btnReady.onclick = () => wsSend({ type:"READY", ready:true });
-  btnStart.onclick = () => wsSend({ type:"START" });
   btnPass.onclick = () => wsSend({ type:"PASS" });
   btnTake.onclick = () => wsSend({ type:"TAKE" });
   btnBeat.onclick = () => wsSend({ type:"BEAT" });
