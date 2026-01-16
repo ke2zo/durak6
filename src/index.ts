@@ -1108,20 +1108,19 @@ export class RoomDO {
     }
 
     // websocket
-    if (request.headers.get("Upgrade") !== "websocket") return bad(426, "Expected websocket")
+    // websocket
+if (request.headers.get("Upgrade") !== "websocket") return bad(426, "Expected websocket")
 
-    const pair = new WebSocketPair()
-    const client = pair[0]
-    const server = pair[1]
-    server.accept()
+const pair = new WebSocketPair()
+const client = pair[0]
+const server = pair[1]
 
-    // IMPORTANT: make it hibernatable
-    this.state.acceptWebSocket(server)
+// ✅ ВАЖНО: НЕ делаем server.accept()
+this.state.acceptWebSocket(server) // accept + регистрация для hibernation
+this.setAttach(server, {})         // можно после acceptWebSocket
 
-    // we don't know tgId until JOIN
-    this.setAttach(server, {})
+return new Response(null, { status: 101, webSocket: client })
 
-    return new Response(null, { status: 101, webSocket: client })
   }
 
   // Hibernatable WS handlers
