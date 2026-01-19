@@ -1,0 +1,17 @@
+{
+  "name": "durak-client",
+  "version": "1.0.0",
+  "description": "Durak card game client with Cocos Creator and PureMVC",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "cc": "^3.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}

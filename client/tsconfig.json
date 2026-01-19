@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "lib": ["ES2020", "DOM"],
+    "moduleResolution": "node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "outDir": "./dist",
+    "rootDir": "./assets/scripts",
+    "baseUrl": "./assets/scripts",
+    "paths": {
+      "@/*": ["./*"]
+    }
+  },
+  "include": ["assets/scripts/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
